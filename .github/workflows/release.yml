@@ -1,0 +1,139 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Match tag to package version
+        id: version
+        shell: pwsh
+        run: |
+          $metadata = cargo +stable metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = @($metadata.packages | Where-Object { $_.name -eq "madm" })
+          if ($package.Count -ne 1) {
+            throw "Expected exactly one madm package, found $($package.Count)."
+          }
+
+          $version = $package[0].version
+          if ($env:GITHUB_REF_NAME -ne "v$version") {
+            throw "Release tag '$env:GITHUB_REF_NAME' must match Cargo.toml version 'v$version'."
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            extension: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            extension: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            extension: zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            extension: zip
+          - os: macos-26
+            target: aarch64-apple-darwin
+            extension: tar.gz
+          - os: macos-26-intel
+            target: x86_64-apple-darwin
+            extension: tar.gz
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable $env:TARGET
+      - name: Test release target
+        shell: pwsh
+        run: cargo +stable test --locked --all-targets --target $env:TARGET
+      - name: Build release binary
+        shell: pwsh
+        run: cargo +stable build --locked --release --target $env:TARGET
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="madm-${VERSION}-${TARGET}"
+          mkdir "${package}"
+          cp "target/${TARGET}/release/madm" "${package}/"
+          cp README.md PHILOSOPHY.md "${package}/"
+          tar -czf "${package}.tar.gz" "${package}"
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $package = "madm-$env:VERSION-$env:TARGET"
+          New-Item -ItemType Directory -Path $package | Out-Null
+          Copy-Item "target\$env:TARGET\release\madm.exe" $package
+          Copy-Item README.md, PHILOSOPHY.md $package
+          Compress-Archive -Path $package -DestinationPath "$package.zip"
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: madm-${{ needs.validate.outputs.version }}-${{ matrix.target }}.${{ matrix.extension }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate SHA-256 checksums
+        working-directory: dist
+        run: sha256sum madm-* > SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "madm $VERSION"

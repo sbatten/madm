@@ -278,3 +278,18 @@ cargo build --release
 
 The integration suite creates isolated fake home directories and real
 temporary bare remotes. CI runs it natively on Windows, Linux, and macOS.
+
+## Publishing a release
+
+Set the package version in `Cargo.toml`, commit the change, then push a matching
+version tag:
+
+```text
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow verifies that the tag exactly matches the package version,
+builds archives for Linux and Windows on x86-64 and ARM64 plus macOS on Apple
+Silicon and Intel, generates SHA-256 checksums, and publishes the assets to a
+GitHub release with automatically generated notes.
