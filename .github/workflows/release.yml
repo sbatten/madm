@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -53,6 +53,14 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             extension: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            extension: tar.gz
+            musl: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            extension: tar.gz
+            musl: true
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             extension: zip
@@ -68,8 +76,17 @@ jobs:
     env:
       TARGET: ${{ matrix.target }}
       VERSION: ${{ needs.validate.outputs.version }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
     steps:
       - uses: actions/checkout@v4
+      - name: Install musl linker
+        if: matrix.musl == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
       - name: Install stable Rust
         shell: pwsh
         run: |
@@ -86,19 +103,33 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          actual="$(target/${TARGET}/release/madm --version)"
+          test "${actual}" = "madm ${VERSION}"
+          if [[ "${TARGET}" == *-musl ]]; then
+            program_headers="$(readelf --program-headers "target/${TARGET}/release/madm")"
+            if grep --quiet INTERP <<<"${program_headers}"; then
+              echo "::error::${TARGET} must produce a statically linked binary."
+              exit 1
+            fi
+          fi
           package="madm-${VERSION}-${TARGET}"
           mkdir "${package}"
           cp "target/${TARGET}/release/madm" "${package}/"
-          cp README.md PHILOSOPHY.md "${package}/"
+          cp LICENSE README.md PHILOSOPHY.md "${package}/"
           tar -czf "${package}.tar.gz" "${package}"
       - name: Package Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $actual = & "target\$env:TARGET\release\madm.exe" --version
+          if ($actual -ne "madm $env:VERSION") {
+            throw "Expected packaged binary version 'madm $env:VERSION', got '$actual'."
+          }
+
           $package = "madm-$env:VERSION-$env:TARGET"
           New-Item -ItemType Directory -Path $package | Out-Null
           Copy-Item "target\$env:TARGET\release\madm.exe" $package
-          Copy-Item README.md, PHILOSOPHY.md $package
+          Copy-Item LICENSE, README.md, PHILOSOPHY.md $package
           Compress-Archive -Path $package -DestinationPath "$package.zip"
       - name: Upload release archive
         uses: actions/upload-artifact@v4
@@ -137,3 +168,14 @@ jobs:
             --verify-tag \
             --generate-notes \
             --title "madm $VERSION"
+
+  publish-packages:
+    name: Publish package manager metadata
+    needs:
+      - validate
+      - publish
+    uses: ./.github/workflows/publish-packages.yml
+    with:
+      tag: ${{ github.ref_name }}
+      publish: true
+    secrets: inherit

@@ -1,0 +1,415 @@
+name: Publish package manager metadata
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Published release tag
+        required: true
+        type: string
+      publish:
+        description: Write metadata to external package repositories
+        required: false
+        default: true
+        type: boolean
+    secrets:
+      HOMEBREW_TAP_TOKEN:
+        required: false
+      WINGET_CREATE_GITHUB_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag
+        required: true
+        type: string
+      publish:
+        description: Write metadata to external package repositories
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  credentials:
+    name: Check publishing credentials
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require credentials before publishing
+        shell: pwsh
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          PUBLISH: ${{ inputs.publish }}
+          WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+        run: |
+          if ($env:PUBLISH -ne "true") {
+            Write-Host "Dry run requested; publishing credentials are not required."
+            exit 0
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:HOMEBREW_TAP_TOKEN)) {
+            throw "HOMEBREW_TAP_TOKEN is required when publish is enabled."
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINGET_CREATE_GITHUB_TOKEN)) {
+            throw "WINGET_CREATE_GITHUB_TOKEN is required when publish is enabled."
+          }
+
+  prepare:
+    name: Verify release and generate metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out released source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+          path: release-source
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Match tag to package version
+        id: version
+        shell: pwsh
+        working-directory: release-source
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          $metadata = cargo +stable metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = @($metadata.packages | Where-Object { $_.name -eq "madm" })
+          if ($package.Count -ne 1) {
+            throw "Expected exactly one madm package, found $($package.Count)."
+          }
+
+          $version = $package[0].version
+          if ($env:TAG -ne "v$version") {
+            throw "Release tag '$env:TAG' must match Cargo.toml version 'v$version'."
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Download published release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          release="$(gh release view "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --json tagName,isDraft,isPrerelease)"
+          if [[ "$(jq -r .tagName <<<"${release}")" != "${TAG}" ]]; then
+            echo "::error::Published release tag does not match ${TAG}."
+            exit 1
+          fi
+          if [[ "$(jq -r .isDraft <<<"${release}")" != "false" || "$(jq -r .isPrerelease <<<"${release}")" != "false" ]]; then
+            echo "::error::Release ${TAG} must be published and stable."
+            exit 1
+          fi
+
+          mkdir -p dist
+          gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "madm-*" \
+            --pattern "SHA256SUMS" \
+            --dir dist
+      - name: Verify release checksums and required assets
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          required=(
+            "madm-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "madm-${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+            "madm-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+            "madm-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+            "madm-${VERSION}-x86_64-pc-windows-msvc.zip"
+            "madm-${VERSION}-aarch64-pc-windows-msvc.zip"
+            "madm-${VERSION}-x86_64-apple-darwin.tar.gz"
+            "madm-${VERSION}-aarch64-apple-darwin.tar.gz"
+          )
+          for name in "${required[@]}"; do
+            if [[ ! -f "dist/${name}" ]]; then
+              echo "::error::Required release asset ${name} is missing."
+              exit 1
+            fi
+          done
+
+          (
+            cd dist
+            sha256sum --check SHA256SUMS
+            find . -maxdepth 1 -type f -name "madm-*" -exec basename {} \; | sort > actual-assets
+            awk '{print $2}' SHA256SUMS | sed 's/^\*//' | sort > checksummed-assets
+            if ! cmp --silent actual-assets checksummed-assets; then
+              echo "::error::SHA256SUMS must cover every and only the published madm archives."
+              diff --unified actual-assets checksummed-assets || true
+              exit 1
+            fi
+          )
+
+          for target in x86_64-pc-windows-msvc aarch64-pc-windows-msvc; do
+            archive="dist/madm-${VERSION}-${target}.zip"
+            expected="madm-${VERSION}-${target}/madm.exe"
+            archive_members="$(unzip -Z1 "${archive}")"
+            if ! grep --fixed-strings --line-regexp --quiet "${expected}" <<<"${archive_members}"; then
+              echo "::error::${archive} does not contain ${expected}."
+              exit 1
+            fi
+          done
+          for target in \
+            x86_64-apple-darwin \
+            aarch64-apple-darwin \
+            x86_64-unknown-linux-musl \
+            aarch64-unknown-linux-musl; do
+            archive="dist/madm-${VERSION}-${target}.tar.gz"
+            expected="madm-${VERSION}-${target}/madm"
+            archive_members="$(tar -tzf "${archive}")"
+            if ! grep --fixed-strings --line-regexp --quiet "${expected}" <<<"${archive_members}"; then
+              echo "::error::${archive} does not contain ${expected}."
+              exit 1
+            fi
+          done
+      - name: Render Homebrew formula
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ruby scripts/render-homebrew-formula.rb \
+            --version "${VERSION}" \
+            --checksums dist/SHA256SUMS \
+            --template packaging/homebrew/madm.rb.erb \
+            --output generated/Formula/madm.rb
+          ruby -c generated/Formula/madm.rb
+      - name: Validate initial WinGet manifests
+        if: steps.version.outputs.version == '0.1.0'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          ruby scripts/validate-winget-manifests.rb \
+            --version "${VERSION}" \
+            --manifests "packaging/winget/${VERSION}" \
+            --checksums dist/SHA256SUMS
+      - name: Stage verified release metadata
+        run: cp dist/SHA256SUMS generated/SHA256SUMS
+      - name: Upload generated package inputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-inputs-${{ steps.version.outputs.version }}
+          path: generated
+          if-no-files-found: error
+          retention-days: 1
+
+  test-homebrew:
+    name: Test Homebrew (${{ matrix.os }})
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-26
+          - macos-26-intel
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+    env:
+      HOMEBREW_NO_ANALYTICS: 1
+      HOMEBREW_NO_AUTO_UPDATE: 1
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: Homebrew/actions/setup-homebrew@a657b8b0cd35d0f65cce41fce9b24cf054b49869
+      - name: Download generated formula
+        uses: actions/download-artifact@v4
+        with:
+          name: package-inputs-${{ needs.prepare.outputs.version }}
+          path: generated
+      - name: Audit and install formula
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -c generated/Formula/madm.rb
+          brew tap-new --no-git sbatten/madm-test
+          tap_directory="$(brew --repository sbatten/madm-test)"
+          cp generated/Formula/madm.rb "${tap_directory}/Formula/madm.rb"
+          brew audit --strict --formula sbatten/madm-test/madm
+          brew install --formula sbatten/madm-test/madm
+          installed_madm="$(brew --prefix madm)/bin/madm"
+          test "$("${installed_madm}" --version)" = "madm ${VERSION}"
+          brew test sbatten/madm-test/madm
+
+  prepare_winget:
+    name: Generate and validate WinGet manifests
+    needs: prepare
+    runs-on: windows-latest
+    outputs:
+      skip: ${{ steps.existing.outputs.skip }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PACKAGE_ID: monekoluv.madm
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download verified checksums
+        uses: actions/download-artifact@v4
+        with:
+          name: package-inputs-${{ needs.prepare.outputs.version }}
+          path: package-inputs
+      - name: Detect an existing version or open submission
+        id: existing
+        shell: pwsh
+        run: |
+          $manifestPath = "manifests/m/monekoluv/madm/$env:VERSION"
+          gh api "repos/microsoft/winget-pkgs/contents/$manifestPath" *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host "$env:PACKAGE_ID $env:VERSION is already published."
+            "skip=true" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+          if ($LASTEXITCODE -ne 1) {
+            throw "Unable to determine whether $env:PACKAGE_ID $env:VERSION is already published."
+          }
+
+          $query = [uri]::EscapeDataString("repo:microsoft/winget-pkgs is:pr is:open $env:PACKAGE_ID $env:VERSION in:title")
+          $json = gh api "/search/issues?q=$query&per_page=10"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Unable to search for an existing $env:PACKAGE_ID $env:VERSION submission."
+          }
+          $result = $json | ConvertFrom-Json
+          $matching = @($result.items | Where-Object {
+            $_.title.Contains($env:PACKAGE_ID) -and $_.title.Contains($env:VERSION)
+          })
+          if ($matching.Count -gt 0) {
+            Write-Host "$env:PACKAGE_ID $env:VERSION already has an open submission: $($matching[0].html_url)"
+            "skip=true" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          "skip=false" >> $env:GITHUB_OUTPUT
+      - name: Download WinGetCreate
+        if: steps.existing.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path winget-package | Out-Null
+          curl.exe --fail --location https://aka.ms/wingetcreate/latest --output winget-package/wingetcreate.exe
+          & winget-package/wingetcreate.exe info
+          if ($LASTEXITCODE -ne 0) {
+            throw "WinGetCreate failed to start."
+          }
+      - name: Stage initial manifests
+        if: steps.existing.outputs.skip != 'true' && needs.prepare.outputs.version == '0.1.0'
+        shell: pwsh
+        run: Copy-Item "packaging/winget/$env:VERSION" winget-package/manifests -Recurse
+      - name: Generate updated manifests
+        if: steps.existing.outputs.skip != 'true' && needs.prepare.outputs.version != '0.1.0'
+        shell: pwsh
+        run: |
+          $x64 = "https://github.com/sbatten/madm/releases/download/v$env:VERSION/madm-$env:VERSION-x86_64-pc-windows-msvc.zip|x64"
+          $arm64 = "https://github.com/sbatten/madm/releases/download/v$env:VERSION/madm-$env:VERSION-aarch64-pc-windows-msvc.zip|arm64"
+          & winget-package/wingetcreate.exe update $env:PACKAGE_ID `
+            --version $env:VERSION `
+            --urls $x64 $arm64 `
+            --release-notes-url "https://github.com/sbatten/madm/releases/tag/v$env:VERSION" `
+            --out winget-package/generated
+          if ($LASTEXITCODE -ne 0) {
+            throw "WinGetCreate failed to generate manifests."
+          }
+
+          $installer = Get-ChildItem winget-package/generated -Filter "*.installer.yaml" -Recurse | Select-Object -First 1
+          if (-not $installer) {
+            throw "WinGetCreate did not generate an installer manifest."
+          }
+          Move-Item $installer.Directory.FullName winget-package/manifests
+      - name: Validate staged manifests
+        if: steps.existing.outputs.skip != 'true'
+        shell: pwsh
+        run: |
+          ruby scripts/validate-winget-manifests.rb `
+            --version $env:VERSION `
+            --manifests winget-package/manifests `
+            --checksums package-inputs/SHA256SUMS
+          if ($LASTEXITCODE -ne 0) {
+            throw "Generated WinGet manifests did not match the published release."
+          }
+      - name: Upload validated WinGet submission
+        if: steps.existing.outputs.skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: winget-submission-${{ needs.prepare.outputs.version }}
+          path: winget-package
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-homebrew:
+    name: Update Homebrew tap
+    if: inputs.publish
+    needs:
+      - credentials
+      - prepare
+      - test-homebrew
+      - prepare_winget
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: sbatten/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+      - name: Download generated formula
+        uses: actions/download-artifact@v4
+        with:
+          name: package-inputs-${{ needs.prepare.outputs.version }}
+          path: generated
+      - name: Commit formula update
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p tap/Formula
+          cp generated/Formula/madm.rb tap/Formula/madm.rb
+          cd tap
+          git add Formula/madm.rb
+          if git diff --cached --quiet; then
+            echo "Homebrew formula already matches madm ${VERSION}."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "madm ${VERSION}"
+          git push origin HEAD:main
+
+  publish-winget:
+    name: Submit WinGet pull request
+    if: inputs.publish && needs.prepare_winget.outputs.skip != 'true'
+    needs:
+      - credentials
+      - prepare
+      - test-homebrew
+      - prepare_winget
+    runs-on: windows-latest
+    env:
+      PACKAGE_ID: monekoluv.madm
+      VERSION: ${{ needs.prepare.outputs.version }}
+      WINGET_CREATE_GITHUB_TOKEN: ${{ secrets.WINGET_CREATE_GITHUB_TOKEN }}
+    steps:
+      - name: Download validated submission
+        uses: actions/download-artifact@v4
+        with:
+          name: winget-submission-${{ needs.prepare.outputs.version }}
+          path: winget-package
+      - name: Submit manifests
+        shell: pwsh
+        run: |
+          & winget-package/wingetcreate.exe submit `
+            --prtitle "New version: $env:PACKAGE_ID version $env:VERSION" `
+            --no-open `
+            winget-package/manifests
+          if ($LASTEXITCODE -ne 0) {
+            throw "WinGetCreate failed to submit the manifests."
+          }
