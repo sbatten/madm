@@ -1,0 +1,37 @@
+class Madm < Formula
+  desc "Minimal, Git-native dotfiles manager"
+  homepage "https://sbatten.github.io/madm/"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "<%= urls.fetch("aarch64-apple-darwin") %>"
+      sha256 "<%= checksums.fetch("aarch64-apple-darwin") %>"
+    end
+
+    on_intel do
+      url "<%= urls.fetch("x86_64-apple-darwin") %>"
+      sha256 "<%= checksums.fetch("x86_64-apple-darwin") %>"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "<%= urls.fetch("aarch64-unknown-linux-musl") %>"
+      sha256 "<%= checksums.fetch("aarch64-unknown-linux-musl") %>"
+    end
+
+    on_intel do
+      url "<%= urls.fetch("x86_64-unknown-linux-musl") %>"
+      sha256 "<%= checksums.fetch("x86_64-unknown-linux-musl") %>"
+    end
+  end
+
+  def install
+    bin.install "madm"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/madm --version")
+  end
+end

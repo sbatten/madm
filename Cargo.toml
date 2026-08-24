@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 description = "A minimal, Git-native dotfiles manager"
+license = "MIT"
+repository = "https://github.com/sbatten/madm"
+homepage = "https://sbatten.github.io/madm/"
 
 [dependencies]
 

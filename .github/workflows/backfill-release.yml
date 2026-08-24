@@ -1,0 +1,231 @@
+name: Backfill release assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to backfill
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    name: Validate existing release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Match tag to package version
+        id: version
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.tag }}
+        run: |
+          $metadata = cargo +stable metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          $package = @($metadata.packages | Where-Object { $_.name -eq "madm" })
+          if ($package.Count -ne 1) {
+            throw "Expected exactly one madm package, found $($package.Count)."
+          }
+
+          $version = $package[0].version
+          if ($env:TAG -ne "v$version") {
+            throw "Release tag '$env:TAG' must match Cargo.toml version 'v$version'."
+          }
+
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Require a published stable release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          $release = gh release view $env:TAG --repo $env:GITHUB_REPOSITORY --json tagName,isDraft,isPrerelease | ConvertFrom-Json
+          if ($release.tagName -ne $env:TAG) {
+            throw "Expected release '$env:TAG', found '$($release.tagName)'."
+          }
+          if ($release.isDraft -or $release.isPrerelease) {
+            throw "Release '$env:TAG' must be published and stable before it can be backfilled."
+          }
+
+  build-musl:
+    name: Build ${{ matrix.target }}
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    env:
+      TAG: ${{ inputs.tag }}
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.validate.outputs.version }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag }}
+      - name: Install musl linker
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Install stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add --toolchain stable $env:TARGET
+      - name: Test release target
+        shell: pwsh
+        run: cargo +stable test --locked --all-targets --target $env:TARGET
+      - name: Build release binary
+        shell: pwsh
+        run: cargo +stable build --locked --release --target $env:TARGET
+      - name: Package release binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(target/${TARGET}/release/madm --version)"
+          test "${actual}" = "madm ${VERSION}"
+          program_headers="$(readelf --program-headers "target/${TARGET}/release/madm")"
+          if grep --quiet INTERP <<<"${program_headers}"; then
+            echo "::error::${TARGET} must produce a statically linked binary."
+            exit 1
+          fi
+          package="madm-${VERSION}-${TARGET}"
+          mkdir "${package}"
+          cp "target/${TARGET}/release/madm" "${package}/"
+          cp README.md PHILOSOPHY.md "${package}/"
+          if [[ -f LICENSE ]]; then
+            cp LICENSE "${package}/"
+          else
+            echo "LICENSE is not present at ${TAG}; packaging the legacy release documentation."
+          fi
+          tar -czf "${package}.tar.gz" "${package}"
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: madm-${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Update existing GitHub release
+    needs:
+      - validate
+      - build-musl
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download newly built archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist/built
+          merge-multiple: true
+      - name: Verify and upload additive assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/existing dist/combined dist/upload dist/published
+          gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "madm-*" \
+            --dir dist/existing
+          gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "SHA256SUMS" \
+            --dir dist/published
+
+          (
+            cd dist/existing
+            sha256sum --check ../published/SHA256SUMS
+          )
+          cp dist/existing/madm-* dist/combined/
+          for built in dist/built/madm-*; do
+            name="$(basename "${built}")"
+            if [[ -f "dist/existing/${name}" ]]; then
+              if ! grep --fixed-strings --quiet "  ${name}" dist/published/SHA256SUMS; then
+                echo "::error::Release asset ${name} exists but is not covered by the published checksums."
+                exit 1
+              fi
+              echo "Release asset ${name} already exists and matches the published checksums."
+            else
+              cp "${built}" dist/upload/
+              cp -f "${built}" dist/combined/
+            fi
+          done
+
+          required=(
+            "madm-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+            "madm-${VERSION}-aarch64-unknown-linux-gnu.tar.gz"
+            "madm-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+            "madm-${VERSION}-aarch64-unknown-linux-musl.tar.gz"
+            "madm-${VERSION}-x86_64-pc-windows-msvc.zip"
+            "madm-${VERSION}-aarch64-pc-windows-msvc.zip"
+            "madm-${VERSION}-x86_64-apple-darwin.tar.gz"
+            "madm-${VERSION}-aarch64-apple-darwin.tar.gz"
+          )
+          for name in "${required[@]}"; do
+            if [[ ! -f "dist/combined/${name}" ]]; then
+              echo "::error::Required release asset ${name} is missing."
+              exit 1
+            fi
+          done
+
+          (
+            cd dist/combined
+            sha256sum madm-* > ../SHA256SUMS
+            sha256sum --check ../SHA256SUMS
+          )
+
+          shopt -s nullglob
+          uploads=(dist/upload/madm-*)
+          if (( ${#uploads[@]} > 0 )); then
+            gh release upload "${TAG}" "${uploads[@]}" --repo "${GITHUB_REPOSITORY}"
+          else
+            echo "All musl release assets already match; no archives to upload."
+          fi
+
+          if cmp --silent dist/SHA256SUMS dist/published/SHA256SUMS; then
+            echo "Published checksums already match."
+          else
+            gh release upload "${TAG}" dist/SHA256SUMS \
+              --repo "${GITHUB_REPOSITORY}" \
+              --clobber
+          fi
+
+  publish-packages:
+    name: Publish package manager metadata
+    needs:
+      - validate
+      - publish
+    uses: ./.github/workflows/publish-packages.yml
+    with:
+      tag: ${{ inputs.tag }}
+      publish: true
+    secrets: inherit

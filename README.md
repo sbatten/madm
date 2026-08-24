@@ -35,7 +35,27 @@ that define the project's scope.
 - Git available on `PATH`
 - Rust 1.85 or newer to build from source
 
-## Install from source
+## Install
+
+On macOS or Linux, install the prebuilt binary from the Homebrew tap:
+
+```text
+brew install sbatten/tap/madm
+```
+
+The fully qualified name trusts only the `madm` formula in this third-party
+tap.
+
+On Windows, install the portable package from WinGet:
+
+```text
+winget install --exact --id monekoluv.madm
+```
+
+WinGet releases become available after the corresponding pull request passes
+the community repository's checks and is merged.
+
+### Install from source
 
 ```text
 cargo install --path .
@@ -293,6 +313,38 @@ git push origin v0.1.0
 ```
 
 The release workflow verifies that the tag exactly matches the package version,
-builds archives for Linux and Windows on x86-64 and ARM64 plus macOS on Apple
-Silicon and Intel, generates SHA-256 checksums, and publishes the assets to a
-GitHub release with automatically generated notes.
+builds archives for Windows, macOS, and GNU Linux on x86-64 and ARM64, adds
+static musl archives for Homebrew on Linux, generates SHA-256 checksums, and
+publishes the assets to a GitHub release with automatically generated notes.
+It then tests and updates `sbatten/homebrew-tap` and opens a
+`monekoluv.madm` pull request in `microsoft/winget-pkgs`.
+
+Package publishing requires these repository secrets:
+
+- `HOMEBREW_TAP_TOKEN`: a fine-grained personal access token with contents
+  read/write access to only `sbatten/homebrew-tap`.
+- `WINGET_CREATE_GITHUB_TOKEN`: a classic personal access token with the
+  `public_repo` scope. WinGetCreate does not support fine-grained tokens.
+
+Test package generation without external writes:
+
+```text
+gh workflow run publish-packages.yml -f tag=v0.1.0 -f publish=false
+```
+
+Retry package publication for an existing release:
+
+```text
+gh workflow run publish-packages.yml -f tag=v0.1.0 -f publish=true
+```
+
+To add missing musl archives to an existing release and regenerate its
+checksums, run:
+
+```text
+gh workflow run backfill-release.yml -f tag=v0.1.0
+```
+
+The backfill never replaces an archive whose published checksum does not
+verify. Homebrew and WinGet failures do not remove a valid GitHub release; fix
+the reported issue and retry package publication by tag.
