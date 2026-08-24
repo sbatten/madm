@@ -2,6 +2,9 @@
 
 `madm` is a minimal, Git-native dotfiles manager written in Rust.
 
+[Documentation](https://sbatten.github.io/madm/) |
+[Releases](https://github.com/sbatten/madm/releases)
+
 Your home directory is the working tree. There is no second checkout, no
 symlink farm, and no madm-specific repository format. The repository lives at
 the same fixed path on every supported operating system:
