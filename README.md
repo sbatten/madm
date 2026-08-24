@@ -14,6 +14,9 @@ Most commands are passed directly to the installed `git` executable. This
 keeps ordinary Git behavior, aliases, configuration, hooks, transports, and
 credentials intact while adding a few safe dotfile workflows.
 
+See [PHILOSOPHY.md](PHILOSOPHY.md) for the principles and decision criteria
+that define the project's scope.
+
 ## Principles
 
 - The real home directory is the only work tree.
