@@ -324,7 +324,10 @@ Package publishing requires these repository secrets:
 - `HOMEBREW_TAP_TOKEN`: a fine-grained personal access token with contents
   read/write access to only `sbatten/homebrew-tap`.
 - `WINGET_CREATE_GITHUB_TOKEN`: a classic personal access token with the
-  `public_repo` scope. WinGetCreate does not support fine-grained tokens.
+  `public_repo` scope and an expiration no more than eight days away, as
+  required by the Microsoft Open Source enterprise. Authorize the token for
+  the Microsoft Open Source enterprise under the token's **Configure SSO**
+  menu. WinGetCreate does not support fine-grained tokens.
 
 Test package generation without external writes:
 
